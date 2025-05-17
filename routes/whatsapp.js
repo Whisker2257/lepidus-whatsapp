@@ -15,38 +15,37 @@ import { v4 as uuidv4 } from 'uuid';
 const router = express.Router();
 const twilioClient = twilio(cfg.twilio.sid, cfg.twilio.token);
 
-/**
- * Twilio WhatsApp POST Webhook
- * Expects: application/x-www-form-urlencoded
- */
 router.post('/', async (req, res) => {
-  // immediately acknowledge to Twilio
+  logger.info('Webhook hit:', req.method, req.url);
+  // Ack immediately
   res.type('text/xml').send('<Response></Response>');
 
-  const from = req.body.From;               // e.g. "whatsapp:+263712345678"
+  const from = req.body.From;
   const numMedia = parseInt(req.body.NumMedia ?? '0', 10);
+  logger.info(`Parsed From=${from}, NumMedia=${numMedia}`);
 
   if (!from || numMedia === 0) {
-    await sendText(
-      twilioClient,
-      from,
-      '📸 Please send a clear photo of a math question.'
-    );
+    logger.info('No media or no from; sending prompt to user');
+    await sendText(twilioClient, from, '📸 Please send a clear photo of a math question.');
     return;
   }
 
   logger.info(`New solve request from ${from}`);
   const mediaUrl = req.body.MediaUrl0;
+  logger.info('Media URL:', mediaUrl);
 
   try {
-    // notify student
+    // 1) Notify the student
+    logger.info('Sending acknowledgement text');
     await sendText(
       twilioClient,
       from,
       '✅ Got your question! Crunching the steps now—PDF arriving shortly…'
     );
+    logger.info('Ack sent');
 
-    // 1. Download the image buffer (use Twilio auth only for twilio.com URLs)
+    // 2) Download the image
+    logger.info('Downloading image buffer');
     const { data: imageBuffer } = mediaUrl.includes('twilio.com')
       ? await axios.get(mediaUrl, {
           responseType: 'arraybuffer',
@@ -56,34 +55,36 @@ router.post('/', async (req, res) => {
           }
         })
       : await axios.get(mediaUrl, { responseType: 'arraybuffer' });
+    logger.info('Downloaded image bytes:', imageBuffer.length);
 
-    // 2. OCR via Mathpix → Mathpix Markdown
+    // 3) OCR via Mathpix → Markdown
+    logger.info('Calling mathpixExtract()');
     const markdown = await mathpixExtract(imageBuffer);
+    logger.info('Mathpix returned Markdown length:', markdown.length);
 
-    // 3. Solve the question with GPT-4o (HTML output)
+    // 4) Solve via OpenAI
+    logger.info('Calling solveWithOpenAI()');
     const { htmlSteps, title } = await solveWithOpenAI(markdown);
+    logger.info('OpenAI returned HTML steps length:', htmlSteps.length, 'Title:', title);
 
-    // 4. Build the PDF (question markdown + solution HTML)
-    const pdfBuffer = await buildPdf({
-      title,
-      latex: markdown,
-      htmlSteps
-    });
+    // 5) Build PDF
+    logger.info('Building PDF');
+    const pdfBuffer = await buildPdf({ title, latex: markdown, htmlSteps });
+    logger.info('PDF built bytes:', pdfBuffer.length);
 
-    // 5. Upload PDF to S3
+    // 6) Upload PDF to S3
     const key = `solutions/${uuidv4()}.pdf`;
+    logger.info('Uploading PDF to S3 at key:', key);
     const pdfUrl = await uploadBuffer(pdfBuffer, key);
+    logger.info('PDF uploaded; URL:', pdfUrl);
 
-    // 6. Send back as WhatsApp document
-    await sendDocument(
-      twilioClient,
-      from,
-      pdfUrl,
-      `Solution_${title}.pdf`
-    );
+    // 7) Send PDF back
+    logger.info('Sending document to user');
+    await sendDocument(twilioClient, from, pdfUrl, `Solution_${title}.pdf`);
+    logger.info('Document sent successfully');
 
   } catch (err) {
-    logger.error(err);
+    logger.error('Error in solve flow:', err);
     await sendText(
       twilioClient,
       from,
