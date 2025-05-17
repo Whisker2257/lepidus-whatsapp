@@ -17,14 +17,14 @@ const twilioClient = twilio(cfg.twilio.sid, cfg.twilio.token);
 
 /**
  * Twilio WhatsApp POST Webhook
- * Expects: multipart/x-www-form-urlencoded
+ * Expects: application/x-www-form-urlencoded
  */
 router.post('/', async (req, res) => {
-  const from = req.body.From;      // e.g. "whatsapp:+2637XXXXXXX"
-  const numMedia = parseInt(req.body.NumMedia || '0', 10);
-
-  // Acknowledge immediately so Twilio doesn’t wait
+  // immediately acknowledge to Twilio
   res.type('text/xml').send('<Response></Response>');
+
+  const from = req.body.From;               // e.g. "whatsapp:+263712345678"
+  const numMedia = parseInt(req.body.NumMedia ?? '0', 10);
 
   if (!from || numMedia === 0) {
     await sendText(
@@ -35,52 +35,59 @@ router.post('/', async (req, res) => {
     return;
   }
 
-  const mediaUrl = req.body.MediaUrl0;
   logger.info(`New solve request from ${from}`);
+  const mediaUrl = req.body.MediaUrl0;
 
   try {
-    // Let the user know we’re on it
+    // notify student
     await sendText(
       twilioClient,
       from,
       '✅ Got your question! Crunching the steps now—PDF arriving shortly…'
     );
 
-    // 1. Download the image buffer
-    const { data: imageBuffer } = await axios.get(mediaUrl, {
-      responseType: 'arraybuffer',
-      auth: {
-        username: cfg.twilio.sid,
-        password: cfg.twilio.token
-      }
+    // 1. Download the image buffer (use Twilio auth only for twilio.com URLs)
+    const { data: imageBuffer } = mediaUrl.includes('twilio.com')
+      ? await axios.get(mediaUrl, {
+          responseType: 'arraybuffer',
+          auth: {
+            username: cfg.twilio.sid,
+            password: cfg.twilio.token
+          }
+        })
+      : await axios.get(mediaUrl, { responseType: 'arraybuffer' });
+
+    // 2. OCR via Mathpix → Mathpix Markdown
+    const markdown = await mathpixExtract(imageBuffer);
+
+    // 3. Solve the question with GPT-4o (HTML output)
+    const { htmlSteps, title } = await solveWithOpenAI(markdown);
+
+    // 4. Build the PDF (question markdown + solution HTML)
+    const pdfBuffer = await buildPdf({
+      title,
+      latex: markdown,
+      htmlSteps
     });
-
-    // 2. OCR via Mathpix → LaTeX
-    const latex = await mathpixExtract(imageBuffer);
-
-    // 3. Solve the question with GPT-4o
-    const { htmlSteps, title } = await solveWithOpenAI(latex);
-
-    // 4. Build the PDF
-    const pdfBuffer = await buildPdf({ title, latex, htmlSteps });
 
     // 5. Upload PDF to S3
     const key = `solutions/${uuidv4()}.pdf`;
     const pdfUrl = await uploadBuffer(pdfBuffer, key);
 
-    // 6. Send back as a WhatsApp document
+    // 6. Send back as WhatsApp document
     await sendDocument(
       twilioClient,
       from,
       pdfUrl,
       `Solution_${title}.pdf`
     );
+
   } catch (err) {
     logger.error(err);
     await sendText(
       twilioClient,
       from,
-      '❌ Sorry, I hit a snag while solving that. Could you try retaking the photo?'
+      '❌ Sorry, something went wrong processing your question. Could you try again?'
     );
   }
 });
