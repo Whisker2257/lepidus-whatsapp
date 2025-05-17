@@ -1,5 +1,7 @@
+// routes/whatsapp.js
+
 import express from 'express';
-import { Twilio } from 'twilio';
+import twilio from 'twilio';
 import { cfg } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { mathpixExtract } from '../services/mathpixService.js';
@@ -11,21 +13,25 @@ import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
 
 const router = express.Router();
-const twilioClient = new Twilio(cfg.twilio.sid, cfg.twilio.token);
+const twilioClient = twilio(cfg.twilio.sid, cfg.twilio.token);
 
 /**
  * Twilio WhatsApp POST Webhook
  * Expects: multipart/x-www-form-urlencoded
  */
 router.post('/', async (req, res) => {
-  const from = req.body.From; // "whatsapp:+263..."
+  const from = req.body.From;      // e.g. "whatsapp:+2637XXXXXXX"
   const numMedia = parseInt(req.body.NumMedia || '0', 10);
 
-  // Quick reply so Twilio isn’t kept waiting
+  // Acknowledge immediately so Twilio doesn’t wait
   res.type('text/xml').send('<Response></Response>');
 
   if (!from || numMedia === 0) {
-    await sendText(twilioClient, from, '📸 Please send a clear photo of a math question.');
+    await sendText(
+      twilioClient,
+      from,
+      '📸 Please send a clear photo of a math question.'
+    );
     return;
   }
 
@@ -33,13 +39,14 @@ router.post('/', async (req, res) => {
   logger.info(`New solve request from ${from}`);
 
   try {
+    // Let the user know we’re on it
     await sendText(
       twilioClient,
       from,
       '✅ Got your question! Crunching the steps now—PDF arriving shortly…'
     );
 
-    // 1. Download the image
+    // 1. Download the image buffer
     const { data: imageBuffer } = await axios.get(mediaUrl, {
       responseType: 'arraybuffer',
       auth: {
@@ -48,21 +55,26 @@ router.post('/', async (req, res) => {
       }
     });
 
-    // 2. OCR via Mathpix
+    // 2. OCR via Mathpix → LaTeX
     const latex = await mathpixExtract(imageBuffer);
 
-    // 3. Solve with GPT-4o
+    // 3. Solve the question with GPT-4o
     const { htmlSteps, title } = await solveWithOpenAI(latex);
 
-    // 4. Render PDF
+    // 4. Build the PDF
     const pdfBuffer = await buildPdf({ title, latex, htmlSteps });
 
-    // 5. Store in S3
+    // 5. Upload PDF to S3
     const key = `solutions/${uuidv4()}.pdf`;
     const pdfUrl = await uploadBuffer(pdfBuffer, key);
 
-    // 6. Send back via WhatsApp (Document message)
-    await sendDocument(twilioClient, from, pdfUrl, `Solution_${title}.pdf`);
+    // 6. Send back as a WhatsApp document
+    await sendDocument(
+      twilioClient,
+      from,
+      pdfUrl,
+      `Solution_${title}.pdf`
+    );
   } catch (err) {
     logger.error(err);
     await sendText(
